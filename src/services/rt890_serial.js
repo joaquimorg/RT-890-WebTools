@@ -54,6 +54,18 @@ const verifyChecksum = (bytes) => {
   return sum === bytes[bytes.length - 1];
 };
 
+const SPI_RANGES = [
+  { cmd: 0x40, offset: 0x000000, size: 0x2d0000 },
+  { cmd: 0x41, offset: 0x2d0000, size: 0x028000 },
+  { cmd: 0x42, offset: 0x2f8000, size: 0x022000 },
+  { cmd: 0x43, offset: 0x31a000, size: 0x002000 },
+  { cmd: 0x47, offset: 0x3b4a00, size: 0x00a000 },
+  { cmd: 0x48, offset: 0x3bf000, size: 0x001000 },
+  { cmd: 0x49, offset: 0x3c1000, size: 0x00a000 },
+  { cmd: 0x4b, offset: 0x3d8000, size: 0x00a000 },
+  { cmd: 0x4c, offset: 0x31c000, size: 0x099000 }
+];
+
 export class RT890Serial {
   constructor(port, timeoutMs = DEFAULT_TIMEOUT_MS) {
     this.port = port;
@@ -146,6 +158,36 @@ export class RT890Serial {
       throw new Error(`Timeout while reading ${size} bytes`);
     }
     return output;
+  }
+
+  async drainInput(maxCycles = 8) {
+    this.readBuffer = new Uint8Array(0);
+    if (!this.port || !this.port.readable) {
+      return;
+    }
+    const reader = this.port.readable.getReader();
+    try {
+      for (let i = 0; i < maxCycles; i += 1) {
+        let timeoutId;
+        try {
+          const readPromise = reader.read();
+          const timeoutPromise = new Promise((resolve) => {
+            timeoutId = setTimeout(() => resolve({ value: null, done: true }), 30);
+          });
+          const { value, done } = await Promise.race([readPromise, timeoutPromise]);
+          clearTimeout(timeoutId);
+          if (done || !value || value.length === 0) {
+            break;
+          }
+        } finally {
+          clearTimeout(timeoutId);
+        }
+      }
+    } catch {
+      // Ignore drain errors.
+    } finally {
+      reader.releaseLock();
+    }
   }
 
   async enterProgrammingMode() {
@@ -283,19 +325,89 @@ export class RT890Serial {
     checksum(cmd);
     await this.write(cmd);
 
-    const block = await this.readExact(128 + 4);
-    if (block[0] === 0xff) {
+    const header = await this.readExact(1);
+    if (header[0] === 0xff) {
       return null;
     }
+    const remainder = await this.readExact(128 + 3);
+    const block = new Uint8Array(128 + 4);
+    block[0] = header[0];
+    block.set(remainder, 1);
     if (!verifyChecksum(block)) {
       throw new Error('Flash read checksum failed.');
     }
     return block.slice(3, 3 + 128);
   }
 
+  async writeSpiFlash(offset, data) {
+    let range = null;
+    for (const entry of SPI_RANGES) {
+      const rangeEnd = entry.offset + entry.size;
+      if (offset >= entry.offset && offset < rangeEnd) {
+        range = entry;
+        break;
+      }
+    }
+    if (!range) {
+      return true;
+    }
+    const rangeEnd = range.offset + range.size;
+    const blockIndex = Math.floor((offset - range.offset) / 128);
+    const remaining = Math.max(0, Math.min(128, rangeEnd - offset, data.length - offset));
+
+    const cmd = new Uint8Array(128 + 4);
+    cmd[0] = range.cmd;
+    cmd[1] = (blockIndex >> 8) & 0xff;
+    cmd[2] = blockIndex & 0xff;
+    if (remaining > 0) {
+      cmd.set(data.slice(offset, offset + remaining), 3);
+    }
+    checksum(cmd);
+    await this.write(cmd);
+    const ack = await this.readExact(1);
+    if (ack[0] !== 0x06) {
+      throw new Error(`Failed to write SPI flash at 0x${offset.toString(16)}`);
+    }
+    return true;
+  }
+
   async isBootloaderMode() {
     const data = await this.readFlash(0x0000);
+    if (data === null) {
+      await this.drainInput();
+    }
     return data === null;
+  }
+
+  async backupSpiFlash(onProgress) {
+    const blocks = 0x8000;
+    const blockSize = 128;
+    const totalSize = blocks * blockSize;
+    const output = new Uint8Array(totalSize);
+    for (let block = 0; block < blocks; block += 1) {
+      const data = await this.readFlash(block);
+      if (!data) {
+        throw new Error('Failed to read SPI flash.');
+      }
+      output.set(data, block * blockSize);
+      if (onProgress) {
+        const percent = Math.round(((block + 1) / blocks) * 100);
+        onProgress(percent);
+      }
+    }
+    return output;
+  }
+
+  async restoreSpiFlash(data, onProgress) {
+    const totalBlocks = Math.ceil(data.length / 128);
+    for (let block = 0; block < totalBlocks; block += 1) {
+      const offset = block * 128;
+      await this.writeSpiFlash(offset, data);
+      if (onProgress) {
+        const percent = Math.round(((block + 1) / totalBlocks) * 100);
+        onProgress(percent);
+      }
+    }
   }
 
   async flashFirmware(firmware, onProgress) {

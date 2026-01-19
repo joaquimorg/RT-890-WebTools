@@ -84,9 +84,10 @@
           </button>
         </div>
 
-        <div class="card card-accent">
+        <div class="card card-success">
           <h3>Firmware</h3>
-          <p>Flash packed firmware to the radio. Boot mode required.</p>
+          <p>Flash packed firmware to the radio.</p>
+          <p>Note: Radio must be in Boot mode (turn on pressing the two side buttons).</p>
           <div class="file-picker">
             <label class="file-label" for="firmware-file">Choose file</label>
             <input id="firmware-file" type="file" @change="onFirmwareFile" />
@@ -97,6 +98,40 @@
               <path d="M13 3L6 14h5l-1 7 8-12h-5z" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linejoin="round"/>
             </svg>
             Program firmware
+          </button>
+        </div>
+
+        <div class="card">
+          <h3>SPI backup</h3>
+          <p>Read the full SPI flash contents (normal mode).</p>
+          <p>This is slow and can take several minutes.</p>
+          <button class="button primary" @click="startSpiBackup" :disabled="!isConnected">
+            <svg class="btn-icon" viewBox="0 0 24 24" aria-hidden="true">
+              <path d="M12 4v10" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round"/>
+              <path d="M8 10l4 4 4-4" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round"/>
+              <path d="M5 18h14" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round"/>
+            </svg>
+            Backup SPI
+          </button>
+          <div class="hint">Expect a large file (4 MB).</div>
+        </div>
+
+        <div class="card">
+          <h3>SPI restore</h3>
+          <p>Write a SPI backup file back to the radio (normal mode).</p>
+          <p>This process is slow and can take several minutes.</p>
+          <div class="file-picker">
+            <label class="file-label" for="spi-restore-file">Choose file</label>
+            <input id="spi-restore-file" type="file" @change="onSpiRestoreFile" :disabled="!isConnected" />
+            <span class="file-name">{{ spiRestoreFileName || 'No file chosen' }}</span>
+          </div>
+          <button class="button primary" @click="startSpiRestore" :disabled="!spiRestoreFileName || !isConnected">
+            <svg class="btn-icon" viewBox="0 0 24 24" aria-hidden="true">
+              <path d="M12 20V10" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round"/>
+              <path d="M8 14l4-4 4 4" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round"/>
+              <path d="M5 6h14" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round"/>
+            </svg>
+            Restore SPI
           </button>
         </div>
 
@@ -114,6 +149,13 @@
         </div>
         <div class="log-list">
           <div v-for="entry in logs" :key="entry.id">{{ entry.message }}</div>
+        </div>
+      </section>
+
+      <section v-if="activeView === 'home'" class="grid">
+        <div class="card card-accent">
+          <h3>Warning</h3>
+          <p>Use these tools at your own risk. I am not responsible for any damage, loss, or failures caused to radios.</p>
         </div>
       </section>
 
@@ -165,6 +207,8 @@ const isConnected = ref(false);
 const firmwareVersion = ref('');
 const restoreFileName = ref('');
 const restoreFile = ref(null);
+const spiRestoreFileName = ref('');
+const spiRestoreFile = ref(null);
 const firmwareFileName = ref('');
 const firmwareFile = ref(null);
 
@@ -173,6 +217,7 @@ const baudRates = ref([115200, 57600, 38400]);
 const selectedPort = ref(null);
 const selectedBaud = ref(115200);
 const serial = ref(null);
+const FLASH_BAUD = 115200;
 const activeView = ref('home');
 const heroTitle = computed(() => {
   if (activeView.value === 'channels') {
@@ -268,9 +313,7 @@ const connect = async () => {
   }
 };
 
-const disconnect = async () => {
-  isConnected.value = false;
-  firmwareVersion.value = '';
+const closeActiveSession = async (message) => {
   if (serial.value) {
     try {
       await serial.value.close();
@@ -278,6 +321,16 @@ const disconnect = async () => {
       // Ignore close errors.
     }
   }
+  serial.value = null;
+  isConnected.value = false;
+  firmwareVersion.value = '';
+  if (message) {
+    addLog(message);
+  }
+};
+
+const disconnect = async () => {
+  await closeActiveSession();
   selectedPort.value = null;
   addLog('Disconnected from radio.');
 };
@@ -299,6 +352,71 @@ const startBackup = async () => {
     addLog('EEPROM backup completed.');
   } catch (error) {
     addLog(`EEPROM backup failed: ${error.message}`);
+  } finally {
+    progressVisible.value = false;
+  }
+};
+
+const startSpiBackup = async () => {
+  if (!serial.value) {
+    addLog('Connect to the radio before SPI backup.');
+    return;
+  }
+  addLog('SPI backup started.');
+  progressLabel.value = 'Reading SPI flash';
+  progressValue.value = 0;
+  progressVisible.value = true;
+  try {
+    const isBoot = await serial.value.isBootloaderMode();
+    if (isBoot) {
+      addLog('Radio is in bootloader mode. Use normal mode for SPI backup.');
+      return;
+    }
+    const data = await serial.value.backupSpiFlash((percent) => {
+      progressValue.value = percent;
+    });
+    downloadBlob(data, 'rt890_spi_backup.bin');
+    addLog('SPI backup completed.');
+  } catch (error) {
+    addLog(`SPI backup failed: ${error.message}`);
+  } finally {
+    progressVisible.value = false;
+  }
+};
+
+const onSpiRestoreFile = (event) => {
+  const file = event.target.files[0];
+  spiRestoreFileName.value = file ? file.name : '';
+  spiRestoreFile.value = file || null;
+};
+
+const startSpiRestore = async () => {
+  if (!spiRestoreFile.value) {
+    addLog('Select a SPI backup file before restore.');
+    return;
+  }
+  if (!serial.value) {
+    addLog('Connect to the radio before SPI restore.');
+    return;
+  }
+  addLog(`SPI restore started from ${spiRestoreFileName.value}.`);
+  progressLabel.value = 'Writing SPI flash';
+  progressValue.value = 0;
+  progressVisible.value = true;
+  try {
+    const isBoot = await serial.value.isBootloaderMode();
+    if (isBoot) {
+      addLog('Radio is in bootloader mode. Use normal mode for SPI restore.');
+      return;
+    }
+    const buffer = await spiRestoreFile.value.arrayBuffer();
+    const data = new Uint8Array(buffer);
+    await serial.value.restoreSpiFlash(data, (percent) => {
+      progressValue.value = percent;
+    });
+    addLog('SPI restore completed.');
+  } catch (error) {
+    addLog(`SPI restore failed: ${error.message}`);
   } finally {
     progressVisible.value = false;
   }
@@ -347,30 +465,47 @@ const startFlash = async () => {
     addLog('Select a firmware file before flashing.');
     return;
   }
-  if (!serial.value) {
-    addLog('Connect to the radio before flashing.');
+  if (serial.value) {
+    await closeActiveSession('Disconnected active session for firmware flash.');
+  }
+  let port = selectedPort.value;
+  if (!port) {
+    port = await pickPort();
+  }
+  if (!port) {
+    addLog('No serial port selected.');
     return;
   }
   addLog('Firmware flash started.');
   progressLabel.value = 'Flashing firmware';
   progressValue.value = 0;
   progressVisible.value = true;
+  let flashSerial = null;
   try {
+    flashSerial = new RT890Serial(port);
+    await flashSerial.open(FLASH_BAUD);
     const buffer = await firmwareFile.value.arrayBuffer();
     const firmware = new Uint8Array(buffer);
-    const isBoot = await serial.value.isBootloaderMode();
+    const isBoot = await flashSerial.isBootloaderMode();
     if (!isBoot) {
       addLog('Radio is not in bootloader mode.');
       return;
     }
-    await serial.value.eraseFlash();
-    await serial.value.flashFirmware(firmware, (percent) => {
+    await flashSerial.eraseFlash();
+    await flashSerial.flashFirmware(firmware, (percent) => {
       progressValue.value = percent;
     });
     addLog('Firmware flash completed.');
   } catch (error) {
     addLog(`Firmware flash failed: ${error.message}`);
   } finally {
+    if (flashSerial) {
+      try {
+        await flashSerial.close();
+      } catch {
+        // Ignore close errors.
+      }
+    }
     progressVisible.value = false;
   }
 };
